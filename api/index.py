@@ -17,23 +17,32 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Locate the JSON file
-data_path = Path(__file__).resolve().parent.parent / "q-vercel-latency.json"
-if not data_path.exists():
-    data_path = Path(__file__).resolve().parent / "q-vercel-latency.json"
-if not data_path.exists():
-    data_path = Path("q-vercel-latency.json")
+# Look for the dataset in current folder and parent folder
+curr_dir = Path(__file__).resolve().parent
+search_paths = [
+    curr_dir / "q-vercel-latency.json",
+    curr_dir.parent / "q-vercel-latency.json",
+    Path("q-vercel-latency.json"),
+    Path("api/q-vercel-latency.json"),
+]
 
-try:
-    with open(data_path, "r", encoding="utf-8") as f:
-        TELEMETRY_DATA = json.load(f)
-        if isinstance(TELEMETRY_DATA, dict):
-            for val in TELEMETRY_DATA.values():
-                if isinstance(val, list):
-                    TELEMETRY_DATA = val
-                    break
-except Exception:
-    TELEMETRY_DATA = []
+TELEMETRY_DATA = []
+for p in search_paths:
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    TELEMETRY_DATA = data
+                elif isinstance(data, dict):
+                    for val in data.values():
+                        if isinstance(val, list):
+                            TELEMETRY_DATA = val
+                            break
+            if TELEMETRY_DATA:
+                break
+        except Exception:
+            pass
 
 class LatencyRequest(BaseModel):
     regions: List[str]
@@ -56,45 +65,31 @@ def get_metrics(req: LatencyRequest):
     region_metrics = {}
 
     for region in req.regions:
-        # Match region case-insensitively
+        target = region.strip().lower()
         records = [
             r for r in TELEMETRY_DATA 
-            if str(r.get("region", "")).lower() == region.lower()
+            if str(r.get("region", "")).strip().lower() == target
         ]
 
         if not records:
-            region_metrics[region] = {
-                "avg_latency": 0.0,
-                "p95_latency": 0.0,
-                "avg_uptime": 0.0,
-                "breaches": 0,
-            }
             continue
 
-        # Handle common field names for latency and uptime
         latencies = [
-            float(r.get("latency") if r.get("latency") is not None else r.get("latency_ms", 0))
+            float(r["latency"] if "latency" in r else r.get("latency_ms", 0))
             for r in records
         ]
         uptimes = [
-            float(r.get("uptime") if r.get("uptime") is not None else r.get("uptime_pct", 0))
+            float(r["uptime"] if "uptime" in r else r.get("uptime_pct", 0))
             for r in records
         ]
 
-        avg_lat = float(np.mean(latencies)) if latencies else 0.0
-        p95_lat = float(np.percentile(latencies, 95)) if latencies else 0.0
-        avg_upt = float(np.mean(uptimes)) if uptimes else 0.0
-        breaches_count = sum(1 for lat in latencies if lat > req.threshold_ms)
-
         region_metrics[region] = {
-            "region": region,
-            "avg_latency": avg_lat,
-            "p95_latency": p95_lat,
-            "avg_uptime": avg_upt,
-            "breaches": breaches_count,
+            "avg_latency": float(np.mean(latencies)),
+            "p95_latency": float(np.percentile(latencies, 95)),
+            "avg_uptime": float(np.mean(uptimes)),
+            "breaches": sum(1 for lat in latencies if lat > req.threshold_ms),
         }
 
-    # Return both a regions dictionary and a regions list to satisfy either schema
     return {
         "regions": region_metrics,
         **region_metrics,
