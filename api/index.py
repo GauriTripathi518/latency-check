@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Any
 import numpy as np
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,35 +14,31 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
-# Look for the dataset in current folder and parent folder
-curr_dir = Path(__file__).resolve().parent
-search_paths = [
-    curr_dir / "q-vercel-latency.json",
-    curr_dir.parent / "q-vercel-latency.json",
-    Path("q-vercel-latency.json"),
-    Path("api/q-vercel-latency.json"),
-]
+def load_data():
+    search_paths = [
+        Path(__file__).resolve().parent / "q-vercel-latency.json",
+        Path(__file__).resolve().parent.parent / "q-vercel-latency.json",
+        Path("q-vercel-latency.json"),
+        Path("api/q-vercel-latency.json"),
+    ]
+    for p in search_paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = json.load(f)
+                    if isinstance(content, list):
+                        return content
+                    if isinstance(content, dict):
+                        for val in content.values():
+                            if isinstance(val, list):
+                                return val
+            except Exception:
+                pass
+    return []
 
-TELEMETRY_DATA = []
-for p in search_paths:
-    if p.exists():
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    TELEMETRY_DATA = data
-                elif isinstance(data, dict):
-                    for val in data.values():
-                        if isinstance(val, list):
-                            TELEMETRY_DATA = val
-                            break
-            if TELEMETRY_DATA:
-                break
-        except Exception:
-            pass
+TELEMETRY_DATA = load_data()
 
 class LatencyRequest(BaseModel):
     regions: List[str]
@@ -62,7 +58,8 @@ def preflight_handler(full_path: str):
 @app.post("/api/latency")
 @app.post("/")
 def get_metrics(req: LatencyRequest):
-    region_metrics = {}
+    regions_list = []
+    regions_dict = {}
 
     for region in req.regions:
         target = region.strip().lower()
@@ -71,26 +68,37 @@ def get_metrics(req: LatencyRequest):
             if str(r.get("region", "")).strip().lower() == target
         ]
 
-        if not records:
-            continue
+        latencies = []
+        uptimes = []
+        for r in records:
+            # Safely extract latency
+            lat = r.get("latency") if r.get("latency") is not None else r.get("latency_ms")
+            if lat is not None:
+                latencies.append(float(lat))
+            
+            # Safely extract uptime
+            upt = r.get("uptime") if r.get("uptime") is not None else r.get("uptime_pct")
+            if upt is not None:
+                uptimes.append(float(upt))
 
-        latencies = [
-            float(r["latency"] if "latency" in r else r.get("latency_ms", 0))
-            for r in records
-        ]
-        uptimes = [
-            float(r["uptime"] if "uptime" in r else r.get("uptime_pct", 0))
-            for r in records
-        ]
+        avg_lat = round(float(np.mean(latencies)), 2) if latencies else 0.0
+        p95_lat = round(float(np.percentile(latencies, 95)), 2) if latencies else 0.0
+        avg_upt = round(float(np.mean(uptimes)), 2) if uptimes else 0.0
+        breaches_cnt = sum(1 for l in latencies if l > req.threshold_ms)
 
-        region_metrics[region] = {
-            "avg_latency": float(np.mean(latencies)),
-            "p95_latency": float(np.percentile(latencies, 95)),
-            "avg_uptime": float(np.mean(uptimes)),
-            "breaches": sum(1 for lat in latencies if lat > req.threshold_ms),
+        stats = {
+            "region": region,
+            "avg_latency": avg_lat,
+            "p95_latency": p95_lat,
+            "avg_uptime": avg_upt,
+            "breaches": breaches_cnt,
         }
 
+        regions_list.append(stats)
+        regions_dict[region] = stats
+
+    # Return formats compatible with both array and dictionary expectations
     return {
-        "regions": region_metrics,
-        **region_metrics,
+        "regions": regions_list,
+        **regions_dict
     }
